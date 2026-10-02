@@ -1,83 +1,77 @@
 //
-//  Tweak.x  —— BiliNoAutoRefresh v1.4.2（保守版）
+//  Tweak.x  —— BiliNoAutoRefresh v1.5.0（回到已验证的最小可靠版）
 //
-//  ── v1.4.2 相对 v1.4.1 只做一件事：修编译错误 ──────────────────────────────
-//  v1.4.1 在 CI 上报：Tweak.x:506: use of undeclared identifier 'kStateRefreshing'
-//  原因：编辑常量声明时把 `static const NSInteger kStateRefreshing = 3;` 整行误删了。
-//  已补回，并把刷新状态枚举写全（Idle=1 Pulling=2 Refreshing=3 WillRefresh=4 NoMoreData=5）。
-//  ★ 逻辑与 v1.4.1 **完全一致**，没有任何行为改动。
-//  ★ 顺带在 CI 里加了一道「常量定义自检」，这类错误以后会在编译前就报出人话。
+//  ══ 为什么又改回去 ══════════════════════════════════════════════════════
+//  实测链条（每一条都是真机结论，不是推断）：
 //
-//  ── v1.4.0 实测把 App 搞卡死了，v1.4.1 把风险撤干净 ──────────────────────
-//  现象：注入 v1.4.0 后「打开 B站启动很慢，首页直接卡死」，封面图全是灰的。
-//  与「能正常用」的 v1.3.0 相比，v1.4.0 多出三个**全新变量**，本版逐一处理：
+//    v1.3.0  ✅ 不闪退；钩子挂上 4 个；「返回首页不刷新」**已生效**（用户亲测确认）
+//              唯一毛病：会停在半拉状态，向上划一下恢复 —— 可自愈，只是难看
+//    v1.4.0  ❌ 启动极慢 + 首页直接卡死（挂了两条 UIScrollView 几何热路径钩子，
+//              在里面回写几何值 → 与 App 布局互相纠正 → 布局死循环）
+//    v1.4.1  ❌ CI 编译失败（kStateRefreshing 常量被误删）
+//    v1.4.2  ❌ 下拉刷新即闪退、搜索进视频即闪退（行为 == v1.4.1）
 //
-//   ① 【撤掉】两个全局热路径钩子：UIScrollView -setContentOffset:animated:
-//      和 -setContentInset:。它们会被 App 的每一次布局/滚动调用；而我们在里面
-//      **回写几何值**（把 offset 夹回顶部、把 inset.top 回滚），App 的布局代码
-//      下一帧又设回去 → 两边对着改 = 布局死循环 → 主线程被占满 = 卡死 + 启动慢。
-//      ★ 通用教训：**永远不要让 tweak 去"纠正" App 的几何值**，那是和布局系统抢方向盘。
+//  ★ 根因是我的方法论错了：v1.4.x 在 v1.3.0 之上**一次加了三个新机制**
+//    （-setState: 钩子 / 几何收尾 / 自动弹窗），**一次只该动一个变量**。
+//    所以本版把三个全部撤掉，回到 v1.3.0 的钩子集。
 //
-//   ② 【加阀门】拦刷新本身也可能把 App 挂住：如果首屏是靠 beginRefreshing /
-//      setState:Refreshing 驱动的，我们把它吃掉 → 首屏数据永远不来 → 页面空转。
-//      本版加三道安全阀（见下），任何一道触发都直接放行，宁可漏拦也不卡界面。
+//  ══ 本版做什么 ══════════════════════════════════════════════════════════
+//  只挂 **一个方法**：刷新控件的 `-beginRefreshing`
+//    · 用户自己在下拉（state==Pulling，或 scrollView 正在 dragging/tracking/decelerating）→ 放行
+//    · footer（上拉加载更多）→ 放行
+//    · 其余「程序化刷新」→ 拦掉，不执行原方法
 //
-//   ③ 【后移】"首次拦截自动弹窗"从 2.5s 改成"启动 15 秒之后才允许弹"，
-//      避免在启动过程里 present 一个 alert 干扰 App 自己的启动流程。
+//  ★ 铁律 A：全程**不写任何几何值**（不碰 contentOffset / contentInset / frame）。
+//            v1.4.0 就是死在这一条上。
+//  ★ 铁律 B：全程**不代 App 调用语义 API**（不代叫 endRefreshing 之类）。
+//  ★ 铁律 C：全程**不自动弹窗**。v1.4.x 的「首次拦截后 2.5 秒自动弹」是
+//            「搜索进视频闪退」的头号嫌疑：拦截发生时用户刚好点进视频，
+//            2 秒后正好落在页面转场动画里 present alert → UIKit 崩。
 //
-//  ── 本版只做两件事 ──────────────────────────────────────────────────────
-//   ① 拦 -beginRefreshing / -setState:Refreshing（**只读判断，绝不回写几何值**）
-//   ② 拦完做一次**温和收尾**：只在该控件自己的滚动视图上，把被抬高的 inset.top
-//      还原、把 contentOffset 拉回顶部 → 解决 v1.3.0 的「下拉一下但不刷新、卡住」。
-//      （去掉了 v1.4.0 的 endRefreshing 调用 —— 那是 App 的语义 API，不该由我们代叫。）
+//  ══ 安全阀（纯本地逻辑，不与 App 交互，零风险）═════════════════════════
+//    阀① 启动宽限：插件生效后 20 秒内一律放行 → 保证首屏一定能加载出来
+//    阀③ 重试熔断：3 秒内被拦 > 6 次 → 静默 30 秒（防 App 重试循环被反复吃掉）
+//    （v1.4.x 的「每页首次放行」已去掉 —— 它会让「返回首页」那一次被放过）
 //
-//  ── 三道安全阀（全部"故障时放行"，这是不卡界面的关键）──────────────────
-//   阀① 启动宽限：启动后 N 秒内，一切刷新一律放行 → 保证首屏一定能加载出来。
-//   阀② 每页首次：识别到宿主页面后，**每个页面允许一次**程序化刷新（首屏/首次进入），
-//                 之后的才拦。→ 用户场景（启动已放过一次，返回首页那次才被拦）正好命中。
-//   阀③ 熔断：3 秒内被拦超过 6 次 → 判定 App 在重试循环 → 静默 30 秒全部放行。
-//   另有：认不出宿主页面 → 放行（不认识的场景不下手）；footer（上拉加载更多）→ 放行。
+//    ★ 共同原则：任何异常一律放行。宁可漏拦，绝不卡界面。
 //
-//  ── 取证 ────────────────────────────────────────────────────────────────
-//  统计拆成「触发 / 放行 / 吃掉」，并把每次**放行**和**拦截**都记下「哪个页面 +
-//  调用栈」，弹窗里能直接看到：谁在什么时候触发了刷新、为什么被放行/拦住。
-//  这是彻底定案、并最终把拦截点上移到"触发那一行"的关键证据。
+//  ══ 已知问题（本版刻意不治，留作下一步单独处理）════════════════════════
+//    「拦截后列表停在半拉状态，向上划一下恢复」。
+//    成因：B站是**先直接把列表拉进下拉区、再调 beginRefreshing**。我们拦掉后者，
+//    前者就没人负责收回。
+//    收尾必须写几何值 → 高风险（v1.4.0 的教训）→ 所以**先确认本版不闪退**，
+//    再单独加「一次性收尾」，一次只动一个变量。
 //
-//  ⚠️ 诊断版：启动 15 秒后，首次拦截会弹一次；之后每次切回前台再弹一次。
-//     定案后把 kShowAlert / kProbeTrigger 改 NO 即可（拦截能力不受影响）。
+//  ══ 诊断 ════════════════════════════════════════════════════════════════
+//    · **不自动弹窗**。只有「切到别的 App 再切回来」时才弹一次统计。
+//    · 弹窗前会检查：有窗口、不在转场动画中、不在 present/dismiss 过程中。
+//    · 日志写在 B站沙盒 Documents/BNR_fix.log（低频：只在放行/拦截时写）。
 //
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <ctype.h>
 
-#pragma mark - 开关
+#pragma mark - 配置
 
-static BOOL kBlockRefresh = YES;    // 总闸：吃掉「非用户触发、且该页面已放过一次」的刷新
-static BOOL kShowAlert    = YES;    // 关掉 = 不弹窗（拦截能力不受影响）
+static BOOL kBlockRefresh = YES;    // 总闸：NO = 只观察不拦（排障用）
+static BOOL kShowAlert    = YES;    // 关掉 = 不弹统计窗（拦截能力不受影响）
 static BOOL kProbeTrigger = YES;    // 记录刷新来源（哪个页面 + 调用栈）
 
-// ── 安全阀（默认全开。全关掉 = 变成"见刷新就拦"的激进版，界面有卡住风险，别关）──
-static BOOL   kStartupGrace     = YES;   // 阀① 启动宽限期
-static double kStartupGraceSecs = 20.0;  //      启动后这么多秒内一律放行
-static BOOL   kFirstPerPage     = YES;   // 阀② 每个页面允许一次程序化刷新
-static BOOL   kBreakRetryLoop   = YES;   // 阀③ 重试循环熔断
-static double kCooldownSecs     = 30.0;  //      熔断后静默这么久
+// 安全阀
+static BOOL   kStartupGrace     = YES;   // 阀①
+static double kStartupGraceSecs = 20.0;
+static BOOL   kBreakRetryLoop   = YES;   // 阀③
+static double kCooldownSecs     = 30.0;
 
 static const char *kTargetBundle = "tv.danmaku.bilianime";
-static const char *kVersion      = "1.4.2";
+static const char *kVersion      = "1.5.0";
 
-// 刷新状态取值（与 MJRefresh / BFCRefresh 一致：Idle=1 Pulling=2 Refreshing=3 WillRefresh=4 NoMoreData=5）
-// ★ 这两个常量必须成对存在：漏掉任何一个都会在 CI 编译期报 "use of undeclared identifier"
-static const NSInteger kStatePulling    = 2;
-static const NSInteger kStateRefreshing = 3;
-
-// 收尾保护：刚放行过用户自己的刷新 → 这段时间内不做几何复位，绝不打扰用户的下拉
-static const NSTimeInterval kAllowGrace = 2.0;
+// 刷新状态取值（MJRefresh / BFCRefresh 系列：Idle=1 Pulling=2 Refreshing=3 WillRefresh=4 NoMoreData=5）
+static const NSInteger kStatePulling = 2;
 
 #pragma mark - 类型垫片
-// 用协议声明要调的外部方法：拿到完整类型，且**不把 objc_msgSend 强转成函数指针**
-// （ARC 下函数指针返回值所有权会算错，这里整个避开）。
+// 用 @protocol 声明要调的外部方法：拿到完整类型，且不把 objc_msgSend 强转成函数指针。
 
 @protocol BNRRefreshLike <NSObject>
 - (NSInteger)state;
@@ -97,17 +91,19 @@ static NSString *BNRClassName(id obj) {
     return n ? [NSString stringWithUTF8String:n] : @"(nil)";
 }
 
+// 上拉加载更多用的 footer 一律不拦
 static BOOL BNRIsFooter(id comp) {
     const char *n = BNRClassNameC(comp);
-    return n && strstr(n, "Footer") != NULL;      // 上拉加载更多用的 footer 一律不拦
+    return n && strstr(n, "Footer") != NULL;
 }
 
+// 类名里带 Refresh / PullToRefresh → 疑似刷新控件
 static BOOL BNRNameLooksLikeRefresh(const char *n) {
     if (!n) return NO;
     return (strstr(n, "Refresh") != NULL) || (strstr(n, "PullToRefresh") != NULL);
 }
 
-// 继承链上出现这些基类 → 这个类也是刷新控件（哪怕它自己的类名里没有 Refresh）
+// 继承链上出现这些基类 → 也算刷新控件（哪怕它自己的类名里没有 Refresh）
 static BOOL BNRIsSubclassOfRefreshBase(Class c) {
     if (!c) return NO;
     static const char *bases[] = {
@@ -115,6 +111,7 @@ static BOOL BNRIsSubclassOfRefreshBase(Class c) {
     };
     for (Class k = class_getSuperclass(c); k != Nil; k = class_getSuperclass(k)) {
         const char *n = class_getName(k);
+        if (!n) continue;
         for (int i = 0; i < 3; i++) {
             if (strcmp(n, bases[i]) == 0) return YES;
         }
@@ -122,7 +119,7 @@ static BOOL BNRIsSubclassOfRefreshBase(Class c) {
     return NO;
 }
 
-// 某个 view 挂在哪个 VC 上（沿响应链往上找），用来辨认「是哪一页在下拉」
+// 某个 view 挂在哪个 VC 上（沿响应链往上找），只用于日志辨认「是哪一页在下拉」
 static UIViewController *BNRViewControllerOf(UIView *v) {
     id r = v;
     for (int i = 0; i < 12 && r; i++) {
@@ -133,10 +130,10 @@ static UIViewController *BNRViewControllerOf(UIView *v) {
     return nil;
 }
 
-#pragma mark - 日志（低频：只在放行/拦截/收尾时写）
+#pragma mark - 日志（低频：只在放行/拦截时写）
 
 static NSString *BNRLogPath(void) {
-    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/BNR_step.log"];
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/BNR_fix.log"];
 }
 
 static void BNRLogLine(NSString *fmt, ...) {
@@ -161,34 +158,26 @@ static void BNRLogLine(NSString *fmt, ...) {
 
 #pragma mark - 计数器 / 运行状态
 
-static int  gHooked       = 0;      // 成功挂钩的方法数
-static int  gSeenBegin    = 0;      // -beginRefreshing 被调用次数
-static int  gAllowBegin   = 0;      // 放行次数
-static int  gBlockedBegin = 0;      // 吃掉次数
-static int  gSeenState    = 0;      // -setState:Refreshing 被调用次数
-static int  gAllowState   = 0;
-static int  gBlockedState = 0;
-static int  gUnstuck      = 0;      // 温和收尾次数
-static int  gCooldownHits = 0;      // 熔断触发次数
+static int  gHooked       = 0;    // 成功挂钩的方法数
+static int  gSeenBegin    = 0;    // -beginRefreshing 被调用次数
+static int  gAllowBegin   = 0;    // 放行次数
+static int  gBlockedBegin = 0;    // 吃掉次数
+static int  gCooldownHits = 0;    // 熔断触发次数
 static BOOL gInstalled    = NO;
-static BOOL gSuppress     = NO;     // 我们自己收尾时跳过闸门逻辑（防自激）
-static BOOL gAutoPopped   = NO;
 
-static NSTimeInterval gStartTime      = 0;   // 插件生效时刻（宽限期基准）
-static NSTimeInterval gLastAllow      = 0;   // 上次放行用户刷新的时间
-static NSTimeInterval gCooldownUntil  = 0;   // 熔断静默截止时间
-static NSTimeInterval gBlockWinStart  = 0;   // 熔断统计窗口起点
-static int            gBlockInWindow  = 0;
+static NSTimeInterval gStartTime     = 0;   // 插件生效时刻（宽限期基准）
+static NSTimeInterval gLastAllow     = 0;   // 上次放行用户刷新的时间
+static NSTimeInterval gCooldownUntil = 0;   // 熔断静默截止时间
+static NSTimeInterval gBlockWinStart = 0;   // 熔断统计窗口起点
+static int            gBlockInWindow = 0;
 
 static NSMutableArray *gHookedNames = nil;
 static NSMutableArray *gFound       = nil;   // 来源取证（最多 4 条）
 static NSTimeInterval  gFoundLast   = 0;
-static NSMutableSet   *gAllowedPages = nil;  // 已经放过一次程序化刷新的页面类名
 
-static void BNRShowStats(void);     // 前置声明（弹窗定义在后面）
-static void BNRAutoPopOnce(void);   // 前置声明
+static void BNRShowStats(void);   // 前置声明（定义在后面）
 
-#pragma mark - 刷新控件 / 页面 判定
+#pragma mark - 刷新控件判定
 
 static NSInteger BNRStateOf(id comp) {
     id p = (id<BNRRefreshLike>)comp;
@@ -217,30 +206,15 @@ static BOOL BNRIsUserDriven(id comp) {
     return NO;
 }
 
-// 这一页是谁？（宿主 VC 的类名）—— 认不出就返回 nil
+// 这一页是谁？（宿主 VC 的类名）—— 认不出返回 nil
 static NSString *BNRPageOf(id comp) {
     UIScrollView *sv = BNRScrollViewOf(comp);
     if (!sv) return nil;
     UIViewController *vc = BNRViewControllerOf(sv);
     if (!vc) return nil;
-    const char *n = object_getClass(vc) ? class_getName(object_getClass(vc)) : NULL;
+    Class c = object_getClass(vc);
+    const char *n = c ? class_getName(c) : NULL;
     return n ? [NSString stringWithUTF8String:n] : nil;
-}
-
-// 该页面是否已经放过一次程序化刷新
-static BOOL BNRPageAlreadyAllowed(NSString *page) {
-    if (!page) return NO;
-    @synchronized (gAllowedPages ?: [NSNull null]) {
-        return [gAllowedPages containsObject:page];
-    }
-}
-
-static void BNRMarkPageAllowed(NSString *page) {
-    if (!page) return;
-    @synchronized (gAllowedPages ?: [NSNull null]) {
-        if (!gAllowedPages) gAllowedPages = [NSMutableSet set];
-        [gAllowedPages addObject:page];
-    }
 }
 
 static NSTimeInterval BNRNow(void) {
@@ -256,30 +230,19 @@ static const char *BNRNextType(const char *t) {
 }
 
 typedef enum {
-    BNRSigVoidNoArg = 0,       // v@:
-    BNRSigVoidIntArg           // v@:q  / v@:i / v@:l …
+    BNRSigVoidNoArg = 0       // v@:
 } BNRSigKind;
 
-// 只接受「返回值 void + self/:_cmd + 期望的参数类型」，其余一律不碰
+// 只接受「返回值 void + self/:_cmd 且没有多余参数」的签名，其余一律不碰
 static BOOL BNRSigCheck(BNRSigKind kind, const char *t) {
     if (!t) return NO;
     const char *p = BNRNextType(t);    if (!p || *p != 'v') return NO;
     p = BNRNextType(p + 1);            if (!p || *p != '@') return NO;
     p = BNRNextType(p + 1);            if (!p || *p != ':') return NO;
     p = BNRNextType(p + 1);
-
     switch (kind) {
         case BNRSigVoidNoArg:
             return (p == NULL);
-
-        case BNRSigVoidIntArg: {
-            if (!p) return NO;
-            char r = *p;
-            if (!(r == 'q' || r == 'Q' || r == 'i' || r == 'I' ||
-                  r == 'l' || r == 'L' || r == 's' || r == 'S' || r == 'c' || r == 'C')) return NO;
-            p = BNRNextType(p + 1);
-            return (p == NULL);
-        }
     }
     return NO;
 }
@@ -287,7 +250,7 @@ static BOOL BNRSigCheck(BNRSigKind kind, const char *t) {
 #pragma mark - 动态挂钩表（(类, 方法) 双键；不用 Logos、不用 substrate）
 
 typedef struct { Class cls; SEL sel; IMP imp; } BNRPatch;
-static BNRPatch gPatches[160];
+static BNRPatch gPatches[32];
 static int      gPatchCount = 0;
 
 static IMP BNROrigFor(id self, SEL sel) {
@@ -327,7 +290,7 @@ static BOOL BNRIsPatched(Class c, SEL sel) {
 static BOOL BNRPatchMethod(Class c, SEL sel, IMP repl, BNRSigKind kind, const char **why) {
     if (!c || !sel || !repl) { if (why) *why = "空参数"; return NO; }
     if (BNRIsPatched(c, sel)) { if (why) *why = "已挂过"; return NO; }
-    if (gPatchCount >= 160)   { if (why) *why = "表满";   return NO; }
+    if (gPatchCount >= 32)    { if (why) *why = "表满";   return NO; }
 
     if (BNROwnerOfSEL(c, sel) != c) { if (why) *why = "继承来的(避碰父类)"; return NO; }
 
@@ -346,9 +309,9 @@ static BOOL BNRPatchMethod(Class c, SEL sel, IMP repl, BNRSigKind kind, const ch
     return YES;
 }
 
-#pragma mark - 取证：记下「哪个页面、什么时候、被放行/被拦」
+#pragma mark - 取证：记下「哪个页面、被放行还是被拦」
 
-static void BNRRecordEvent(NSString *what, NSString *page, UIScrollView *sv, BOOL blocked) {
+static void BNRRecordEvent(NSString *what, NSString *page, BOOL blocked) {
     if (!kProbeTrigger) return;
     NSTimeInterval now = BNRNow();
     if (now - gFoundLast < 1.5) return;      // 节流：最多每 1.5 秒记一条
@@ -360,10 +323,9 @@ static void BNRRecordEvent(NSString *what, NSString *page, UIScrollView *sv, BOO
 
         NSMutableArray *frames = [NSMutableArray array];
         for (NSString *s in [NSThread callStackSymbols]) {
-            if ([s containsString:@"BNRHooked"] || [s containsString:@"BNRRecordEvent"] ||
-                [s containsString:@"BNRUnstick"] || [s containsString:@"BNRDecide"]) continue;
+            if ([s containsString:@"BNRHooked"] || [s containsString:@"BNRRecordEvent"]) continue;
             [frames addObject:s];
-            if (frames.count >= 6) break;
+            if (frames.count >= 5) break;
         }
         NSString *line = [NSString stringWithFormat:@"%@ %@  页面: %@\n    ↳ %@",
                           blocked ? @"⛔️" : @"✅", what,
@@ -377,43 +339,28 @@ static void BNRRecordEvent(NSString *what, NSString *page, UIScrollView *sv, BOO
 #pragma mark - 闸门决策（故障一律放行：宁可漏拦，绝不卡住界面）
 
 static BOOL BNRShouldBlock(id comp, NSString *what) {
-    if (!kBlockRefresh || gSuppress) return NO;
-    if (BNRIsFooter(comp)) return NO;                                  // 上拉加载更多：放行
+    if (!kBlockRefresh) return NO;
 
     @try {
-        if (BNRIsUserDriven(comp)) return NO;                          // 用户自己在下拉：放行
+        if (BNRIsFooter(comp)) return NO;      // 上拉加载更多：放行
+    } @catch (NSException *e) { (void)e; return NO; }
+
+    @try {
+        if (BNRIsUserDriven(comp)) return NO;  // 用户自己在下拉：放行
     } @catch (NSException *e) { (void)e; return NO; }
 
     NSTimeInterval now = BNRNow();
 
     // 阀① 启动宽限：保证首屏一定能加载出来
-    if (kStartupGrace && (now - gStartTime) < kStartupGraceSecs) {
-        BNRMarkPageAllowed(BNRPageOf(comp));
-        return NO;
-    }
+    if (kStartupGrace && (now - gStartTime) < kStartupGraceSecs) return NO;
 
     // 阀③ 熔断静默期：App 正在重试循环 → 全部放行，先让它缓过来
-    if (kBreakRetryLoop && now < gCooldownUntil) {
-        BNRMarkPageAllowed(BNRPageOf(comp));
-        return NO;
-    }
+    if (kBreakRetryLoop && now < gCooldownUntil) return NO;
 
-    // 认不出是哪一页 → 不敢下手，放行
-    NSString *page = BNRPageOf(comp);
-    if (!page || page.length == 0) return NO;
-
-    // 阀② 每个页面允许一次程序化刷新（首屏 / 首次进入这一页）
-    if (kFirstPerPage && !BNRPageAlreadyAllowed(page)) {
-        BNRMarkPageAllowed(page);
-        BNRRecordEvent([NSString stringWithFormat:@"%@ @ %@（该页首次，放行）",
-                        what, BNRClassName(comp)], page, BNRScrollViewOf(comp), NO);
-        return NO;
-    }
-
-    return YES;   // 唯一会拦的分支：非用户触发 + 非 footer + 已过宽限 + 该页已放过一次
+    return YES;   // 唯一会拦的分支：非用户触发 + 非 footer + 已过宽限 + 不在熔断期
 }
 
-// 记录一次拦截；3 秒内拦太多次 → 判定为重试循环 → 熔断 30 秒
+// 记录一次拦截；3 秒内拦太多次 → 判定为重试循环 → 熔断静默
 static void BNRNoteBlocked(void) {
     NSTimeInterval now = BNRNow();
     if (now - gBlockWinStart > 3.0) { gBlockWinStart = now; gBlockInWindow = 0; }
@@ -426,113 +373,33 @@ static void BNRNoteBlocked(void) {
     }
 }
 
-#pragma mark - 温和收尾：把「拉到一半的刷新」复位
-// ★ 只做几何复位，绝不调用 App 的语义 API（v1.4.0 就是多调了 endRefreshing、
-//   又去全局纠正 offset/inset 才把界面搞卡的）。
-// 只在这个控件自己的滚动视图上、且用户没在拖、且刚没放行过用户刷新时才动手。
+#pragma mark - 唯一的钩子：-beginRefreshing
 
-static void BNRUnstickPass(id comp) {
-    if (!comp) return;
-    @try {
-        UIScrollView *sv = BNRScrollViewOf(comp);
-        if (!sv) return;
-        if (sv.isDragging || sv.isTracking || sv.isDecelerating) return;   // 用户正在动，别插手
-        if (gLastAllow > 0 && (BNRNow() - gLastAllow) < kAllowGrace) return; // 刚放行过用户刷新
-
-        BOOL fixed = NO;
-
-        // ① 顶部内边距被抬高 → 还原
-        if ([comp respondsToSelector:NSSelectorFromString(@"scrollViewOriginalInset")]) {
-            id v = [comp valueForKey:@"scrollViewOriginalInset"];
-            if ([v isKindOfClass:[NSValue class]]) {
-                UIEdgeInsets orig = [(NSValue *)v UIEdgeInsetsValue];
-                UIEdgeInsets cur  = sv.contentInset;
-                if (cur.top > orig.top + 0.5) {
-                    gSuppress = YES;
-                    cur.top = orig.top;
-                    [sv setContentInset:cur];
-                    gSuppress = NO;
-                    fixed = YES;
-                }
-            }
-        }
-
-        // ② 位置被拉到顶部之上 → 拉回来
-        CGFloat top = -(sv.adjustedContentInset.top);
-        CGPoint p = sv.contentOffset;
-        if (p.y < top - 1.0) {
-            gSuppress = YES;
-            p.y = top;
-            [sv setContentOffset:p animated:YES];
-            gSuppress = NO;
-            fixed = YES;
-        }
-
-        if (fixed) {
-            __sync_fetch_and_add(&gUnstuck, 1);
-            BNRLogLine(@"🧹 温和收尾 → %@", BNRClassName(comp));
-        }
-    } @catch (NSException *e) { (void)e; }
-}
-
-static void BNRUnstick(id comp) {
-    if (!comp) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ BNRUnstickPass(comp); });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.50 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ BNRUnstickPass(comp); });
-}
-
-#pragma mark - 闸门本体（只读判断，绝不回写几何值）
-
-// ① -beginRefreshing
 static void BNRHookedBeginRefreshing(id self, SEL _cmd) {
     __sync_fetch_and_add(&gSeenBegin, 1);
 
     if (BNRShouldBlock(self, @"beginRefreshing")) {
         __sync_fetch_and_add(&gBlockedBegin, 1);
         BNRNoteBlocked();
-        if (gBlockedBegin <= 20) BNRLogLine(@"⛔️ 拦截 beginRefreshing → %@  页面: %@",
-                                            BNRClassName(self), BNRPageOf(self) ?: @"(未识别)");
-        BNRRecordEvent([NSString stringWithFormat:@"beginRefreshing @ %@",
-                        BNRClassName(self)], BNRPageOf(self), BNRScrollViewOf(self), YES);
-        BNRUnstick(self);
-        BNRAutoPopOnce();
+        if (gBlockedBegin <= 20) {
+            BNRLogLine(@"⛔️ 拦截 beginRefreshing → %@  页面: %@",
+                       BNRClassName(self), BNRPageOf(self) ?: @"(未识别)");
+        }
+        BNRRecordEvent([NSString stringWithFormat:@"beginRefreshing @ %@", BNRClassName(self)],
+                       BNRPageOf(self), YES);
+        // ★ 到此为止：不写几何值、不代叫任何 App 的语义 API、不弹窗。
         return;
     }
 
     __sync_fetch_and_add(&gAllowBegin, 1);
     gLastAllow = BNRNow();
-    if (gAllowBegin <= 12) BNRLogLine(@"✅ 放行 beginRefreshing → %@  页面: %@",
-                                      BNRClassName(self), BNRPageOf(self) ?: @"(未识别)");
-
-    IMP orig = BNROrigFor(self, _cmd);
-    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
-}
-
-// ② -setState:（有的实现直接置 Refreshing，不走 beginRefreshing）
-static void BNRHookedSetState(id self, SEL _cmd, NSInteger newState) {
-    if (newState == kStateRefreshing) {
-        __sync_fetch_and_add(&gSeenState, 1);
-
-        if (BNRShouldBlock(self, @"setState:Refreshing")) {
-            __sync_fetch_and_add(&gBlockedState, 1);
-            BNRNoteBlocked();
-            if (gBlockedState <= 20) BNRLogLine(@"⛔️ 拦截 setState:Refreshing → %@  页面: %@",
-                                                BNRClassName(self), BNRPageOf(self) ?: @"(未识别)");
-            BNRRecordEvent([NSString stringWithFormat:@"setState:Refreshing @ %@",
-                            BNRClassName(self)], BNRPageOf(self), BNRScrollViewOf(self), YES);
-            BNRUnstick(self);
-            BNRAutoPopOnce();
-            return;
-        }
-
-        __sync_fetch_and_add(&gAllowState, 1);
-        gLastAllow = BNRNow();
+    if (gAllowBegin <= 12) {
+        BNRLogLine(@"✅ 放行 beginRefreshing → %@  页面: %@",
+                   BNRClassName(self), BNRPageOf(self) ?: @"(未识别)");
     }
 
     IMP orig = BNROrigFor(self, _cmd);
-    if (orig) ((void (*)(id, SEL, NSInteger))orig)(self, _cmd, newState);
+    if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
 }
 
 #pragma mark - 安装
@@ -542,19 +409,20 @@ static void BNRInstallGates(void) {
     gInstalled = YES;
 
     SEL sBegin = @selector(beginRefreshing);
-    SEL sSet   = NSSelectorFromString(@"setState:");
     NSMutableArray *names = [NSMutableArray array];
     NSMutableArray *notes = [NSMutableArray array];
     int n = 0;
 
     // 命中规则 = 类名含 Refresh  或  继承自 BFC/BPlus/MJ 刷新基类（改名前缀也能命中）
-    // ★ 本版**只挂这两个方法**，不再挂任何 UIScrollView 的全局方法。
+    // ★ 本版**只挂这一个方法**，绝不挂任何 UIScrollView 的全局方法、也绝不挂 -setState:
     unsigned int count = 0;
     Class *list = objc_copyClassList(&count);
     if (list) {
         for (unsigned int i = 0; i < count; i++) {
             Class c = list[i];
+            if (!c) continue;
             const char *nm = class_getName(c);
+            if (!nm) continue;
             if (!BNRNameLooksLikeRefresh(nm) && !BNRIsSubclassOfRefreshBase(c)) continue;
 
             BOOL any = NO;
@@ -562,21 +430,10 @@ static void BNRInstallGates(void) {
             if (BNRPatchMethod(c, sBegin, (IMP)&BNRHookedBeginRefreshing, BNRSigVoidNoArg, &w)) {
                 gHooked++; n++; any = YES;
             } else if (w && strcmp(w, "继承来的(避碰父类)") && strcmp(w, "方法不存在")) {
-                [notes addObject:[NSString stringWithFormat:@"%s -beginRefreshing 跳过(%s)", nm, w]];
+                [notes addObject:[NSString stringWithFormat:@"%s 跳过(%s)", nm, w]];
             }
 
-            // -setState: 只挂 B站自研的那些；UIRefreshControl 的状态枚举取值不同，
-            // 挂它的 setState: 有误判风险，所以只留它的 -beginRefreshing。
-            if (strstr(nm, "UIRefreshControl") == NULL) {
-                w = NULL;
-                if (BNRPatchMethod(c, sSet, (IMP)&BNRHookedSetState, BNRSigVoidIntArg, &w)) {
-                    gHooked++; n++; any = YES;
-                } else if (w && strcmp(w, "继承来的(避碰父类)") && strcmp(w, "方法不存在")) {
-                    [notes addObject:[NSString stringWithFormat:@"%s -setState: 跳过(%s)", nm, w]];
-                }
-            }
-
-            if (any) [names addObject:@(nm)];
+            if (any) [names addObject:[NSString stringWithUTF8String:nm]];
         }
         free(list);
     }
@@ -587,12 +444,11 @@ static void BNRInstallGates(void) {
     BNRLogLine(@"=== v%s 闸门安装：%d 个 → %@  %@", kVersion, n,
                names.count ? [names componentsJoinedByString:@", "] : @"(无)",
                notes.count ? [notes componentsJoinedByString:@"; "] : @"");
-    BNRLogLine(@"=== 安全阀：启动宽限 %.0fs / 每页首次放行 %@ / 重试熔断 %@(%.0fs)",
-               kStartupGraceSecs, kFirstPerPage ? @"开" : @"关",
-               kBreakRetryLoop ? @"开" : @"关", kCooldownSecs);
+    BNRLogLine(@"=== 安全阀：启动宽限 %.0fs / 重试熔断 %@(%.0fs)",
+               kStartupGraceSecs, kBreakRetryLoop ? @"开" : @"关", kCooldownSecs);
 }
 
-#pragma mark - 弹窗
+#pragma mark - 统计弹窗（只在用户主动切回前台时弹，且绝不在转场中弹）
 
 static UIViewController *BNRRootVC(void) {
     @try {
@@ -606,35 +462,33 @@ static UIViewController *BNRRootVC(void) {
     } @catch (NSException *e) { (void)e; return nil; }
 }
 
-static void BNRAlertRetry(NSString *title, NSString *msg, NSString *btn, void (^after)(void), int tries) {
-    if (!kShowAlert) { if (after) after(); return; }
-    UIViewController *root = BNRRootVC();
-    if (!root) {
-        if (tries <= 0) { if (after) after(); return; }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            BNRAlertRetry(title, msg, btn, after, tries - 1);
-        });
-        return;
-    }
+// ★ 只有「稳定态」才允许弹：有窗口、不在转场、不在 present/dismiss 过程中
+static BOOL BNRCanPresent(UIViewController *vc) {
+    if (!vc) return NO;
+    if (!vc.view.window) return NO;
+    if (vc.isBeingPresented || vc.isBeingDismissed) return NO;
+    if (vc.isMovingToParentViewController || vc.isMovingFromParentViewController) return NO;
+    if (vc.transitionCoordinator) return NO;      // 正在做转场动画
+    return YES;
+}
+
+static void BNRAlert(NSString *title, NSString *msg, NSString *btn) {
+    if (!kShowAlert) return;
     @try {
+        UIViewController *root = BNRRootVC();
+        if (!BNRCanPresent(root)) return;
+
         UIViewController *host = root;
         while (host.presentedViewController) host = host.presentedViewController;
+        if (!BNRCanPresent(host)) return;
+        if (host.presentedViewController) return;   // 已经有东西在展示了，别抢
+
         UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                    message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:btn
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) { (void)a; if (after) after(); }]];
+        [ac addAction:[UIAlertAction actionWithTitle:btn style:UIAlertActionStyleDefault handler:nil]];
         [host presentViewController:ac animated:YES completion:nil];
-    } @catch (NSException *e) {
-        (void)e;
-        if (after) after();
-    }
-}
-
-static void BNRAlert(NSString *title, NSString *msg, NSString *btn, void (^after)(void)) {
-    BNRAlertRetry(title, msg, btn, after, 4);
+    } @catch (NSException *e) { (void)e; }
 }
 
 static void BNRShowStats(void) {
@@ -644,40 +498,28 @@ static void BNRShowStats(void) {
         if (BNRNow() - gStartTime < 15.0) return;    // 启动 15 秒内不弹，别干扰启动
 
         NSString *cls   = gHookedNames.count ? [gHookedNames componentsJoinedByString:@"\n"] : @"(无)";
-        NSString *pages = gAllowedPages.count ? [[gAllowedPages allObjects] componentsJoinedByString:@", "] : @"(无)";
         NSString *hints = gFound.count ? [gFound componentsJoinedByString:@"\n\n"] : @"(还没捕捉到)";
         NSString *valve = [NSString stringWithFormat:@"启动宽限剩 %.0fs%@%@",
                            MAX(0.0, kStartupGraceSecs - (BNRNow() - gStartTime)),
                            (gCooldownUntil > BNRNow()) ? @"·熔断中" : @"",
                            gCooldownHits ? [NSString stringWithFormat:@"·熔断过 %d 次", gCooldownHits] : @""];
 
+        NSString *lastAllow = (gLastAllow > 0)
+            ? [NSString stringWithFormat:@"%.0f 秒前", BNRNow() - gLastAllow]
+            : @"(还没有)";
+
         NSString *msg = [NSString stringWithFormat:
             @"挂钩方法: %d 个    %@\n\n"
              "beginRefreshing   触发 %d / 放行 %d / 吃掉 %d\n"
-             "setState:Refreshing  触发 %d / 放行 %d / 吃掉 %d\n"
-             "温和收尾: %d\n\n"
-             "已放过一次的页面:\n%@\n\n"
+             "最近一次放行用户刷新: %@\n\n"
              "挂钩的类:\n%@\n\n"
              "谁在触发刷新:\n%@",
-            gHooked, valve,
-            gSeenBegin, gAllowBegin, gBlockedBegin,
-            gSeenState, gAllowState, gBlockedState,
-            gUnstuck, pages, cls, hints];
+            gHooked, valve, gSeenBegin, gAllowBegin, gBlockedBegin, lastAllow, cls, hints];
 
-        BNRLogLine(@"--- 前台统计：钩=%d 见begin=%d 放行=%d 吃begin=%d 见state=%d 放行=%d 吃state=%d 收尾=%d",
-                   gHooked, gSeenBegin, gAllowBegin, gBlockedBegin,
-                   gSeenState, gAllowState, gBlockedState, gUnstuck);
-        BNRAlert([NSString stringWithFormat:@"BiliNoRefresh v%s 统计", kVersion], msg, @"好", nil);
+        BNRLogLine(@"--- 前台统计：钩=%d 见=%d 放行=%d 吃掉=%d",
+                   gHooked, gSeenBegin, gAllowBegin, gBlockedBegin);
+        BNRAlert([NSString stringWithFormat:@"BiliNoRefresh v%s 统计", kVersion], msg, @"好");
     } @catch (NSException *e) { (void)e; }
-}
-
-// 首次拦截后弹一次（但必须已经过了启动宽限，别在启动过程里弹）
-static void BNRAutoPopOnce(void) {
-    if (!kShowAlert || gAutoPopped) return;
-    if (gStartTime <= 0 || (BNRNow() - gStartTime) < 15.0) return;
-    gAutoPopped = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ BNRShowStats(); });
 }
 
 #pragma mark - 加载入口
@@ -701,7 +543,7 @@ static void BNRInstallWhenReady(int tries) {
 
         BNRInstallGates();
 
-        // 装好后：每次切回前台报一次统计，方便截图（启动 15 秒内不弹）
+        // 装好后：每次切回前台报一次统计（启动 15 秒内不弹，且只在稳定态弹）
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidBecomeActiveNotification
                         object:nil
