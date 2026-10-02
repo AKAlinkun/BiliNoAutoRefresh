@@ -1,50 +1,46 @@
 //
 //  Tweak.x
-//  BiliNoAutoRefresh v1.2.0 —— 防崩溃重构版
+//  BiliNoAutoRefresh v1.3.0 —— 三档自检版
 //
-//  ── v1.1.0 为什么会让 App 启动闪退 ─────────────────────────────────────
-//  v1.1.0 把「遍历全机类表 + 批量替换方法实现」放进了 __attribute__((constructor))。
-//  构造函数跑在 dyld 加载阶段 —— 那一刻 Objective-C 运行时还没稳定，App 自己的库
-//  （含 MJRefresh）也还没加载完。在这种时机调 objc_copyClassList() 会强制 realize
-//  所有已注册的类，再叠上 method_setImplementation() 批量改写方法实现，
-//  极易在启动瞬间把某个类改坏 → 进程被直接杀掉，表现就是「点开就闪退」。
+//  ── 为什么推倒重来 ──────────────────────────────────────────────────────
+//  v1.1.0（启动即扫类表 + 批量换实现）和 v1.2.0（延后安装）**都闪退**。
+//  说明「安装时机」不是唯一变量。必须把变量一个个摘掉，分辨到底哪一层出问题。
 //
-//  ── v1.2.0 相对上一版的六处改动 ─────────────────────────────────────────
-//   1. 构造函数里【只】排一个延后任务，绝不碰运行时。安装推迟到启动完成 + 2 秒，且带
-//      重试 —— 这时 B站的库才加载完，也才扫得到 MJRefresh（上一版「没生效」多半就栽在这）。
-//   2. 动态换实现前【校验方法签名】(v@: / v@:q)，签名不符的一律不碰，杜绝参数错位崩溃。
-//   3. 只改「自己实现了该方法」的类，不再误改父类共享的 Method 影响一堆兄弟类。
-//   4. 去掉最危险的探针：不再 hook NSNotificationCenter（启动期高频 + 递归风险）。
-//   5. 日志只进内存，弹窗时才落盘 —— 热路径里不再有任何文件 I/O。
-//   6. 只在哔哩哔哩里动作；诊断弹窗跳过「冷启动那次激活」，绝不干扰启动过程。
+//  本版做了三件事，把风险面压到最小：
+//    1. **一个 Logos %hook 都不用**（连 UIRefreshControl 也去掉）→ 编译产物不再引用
+//       substrate 符号，Makefile 里再加 -Wl,-dead_strip_dylibs 把 libsubstrate 从依赖表里
+//       摘掉 → TrollFools 不会再注入 CydiaSubstrate。等于把 substrate 这一层整个移出等式。
+//       拦截能力改由纯 objc runtime（method_setImplementation）提供，效果一样。
+//    2. **不做任何时序猜测**：启动后弹第 ① 个窗，你点「继续」才做第 ② 步，再点才做第 ③ 步。
+//       哪一步点完闪退，就是哪一层的锅 —— 不用猜。
+//    3. 每一步都先写日志再弹窗，日志在 Documents/BNR_step.log（Filza 可看）。
 //
-//  ⚠️ 诊断期开关：kShowAlert / kDebugFile 开着，拿到结论后要关掉。
+//  ── 三档分别是 ─────────────────────────────────────────────────────────
+//    ① 存活确认：什么都不做，只报 bundle + 几个关键类是否存在（这一步崩 = 注入层问题）
+//    ② 只读扫描：objc_copyClassList 遍历全机类表，只读不写，报告发现哪些刷新控件
+//    ③ 安装闸门：只对 -beginRefreshing 换实现（不碰 setState:），报告挂钩数量
+//
+//  ⚠️ 诊断版：会弹 3 个窗，之后每次切回前台还弹一次统计。定案后把 kShowAlert 改 NO 即可。
 //
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <objc/message.h>
 #import <ctype.h>
 
 #pragma mark - 开关
 
-static BOOL kEnabled      = YES;   // 总开关：NO = 整个插件什么都不做
-static BOOL kBlockRefresh = YES;   // 拦截「非用户触发」的自动刷新
-static BOOL kShowAlert    = YES;   // 诊断期：切后台再切回来时弹窗汇报
-static BOOL kDebugFile    = YES;   // 诊断期：弹窗时把内存日志落盘，方便细看
-static BOOL kProbeVC      = YES;   // 探针：记录关键页面生命周期
-static BOOL kProbeReload  = YES;   // 探针：记录关键列表的 reloadData
+static BOOL kBlockRefresh = YES;   // 第 ③ 档才用到
+static BOOL kShowAlert    = YES;   // 关掉它 = 不弹窗（拦截功能不受影响）
 
 static const char *kTargetBundle = "tv.danmaku.bilianime";
+static const char *kVersion      = "1.3.0-t3";
 
-// MJRefreshState 取值（取自 MJRefresh 源码，别改）
-static const NSInteger kStateIdle    = 1;
+// MJRefreshState 取值（取自 MJRefresh 源码）
 static const NSInteger kStatePulling = 2;
-static const NSInteger kStateRefresh = 3;
 
 #pragma mark - 类型垫片
-// 用协议声明要调的外部方法：既能拿到完整类型（绕开「给前向声明的类发消息」这类编译错误），
-// 又不依赖任何第三方头文件，更不用把 objc_msgSend 强转成函数指针（ARC 下有过度释放风险）。
+// 用协议声明要调的外部方法：拿到完整类型，且**不用把 objc_msgSend 强转成函数指针**
+// （ARC 下函数指针返回值所有权会算错，这里避开）。
 
 @protocol BNRRefreshLike <NSObject>
 - (NSInteger)state;
@@ -64,61 +60,33 @@ static NSString *BNRClassName(id obj) {
     return n ? [NSString stringWithUTF8String:n] : @"(nil)";
 }
 
-// 关键页面判定的关键词（纯 C 数组，热路径不产生任何对象）
-static const char *kBNRKeywords[] = {
-    "Home", "Feed", "Recommend", "Index", "Square",
-    "Video", "Search", "Detail", "Main", "Root"
-};
+#pragma mark - 日志（全程只写 3~6 次，不在任何热路径里）
 
-static BOOL BNRKeywordHitC(const char *n) {
-    if (!n) return NO;
-    if (strlen(n) < 3) return NO;
-    for (size_t i = 0; i < sizeof(kBNRKeywords) / sizeof(kBNRKeywords[0]); i++) {
-        if (strstr(n, kBNRKeywords[i])) return YES;
-    }
-    return NO;
+static NSString *BNRLogPath(void) {
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/BNR_step.log"];
 }
 
-#pragma mark - 内存事件缓冲（不做任何文件 I/O）
-
-static NSMutableArray<NSString *> *BNREvents(void) {
-    static NSMutableArray *a; static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = [NSMutableArray array]; });
-    return a;
-}
-static NSMutableSet<NSString *> *BNRSeenVC(void) {
-    static NSMutableSet *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
-    return s;
-}
-static NSMutableSet<NSString *> *BNRReloadOwners(void) {
-    static NSMutableSet *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
-    return s;
-}
-static NSMutableSet<NSString *> *BNRRefreshClasses(void) {
-    static NSMutableSet *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
-    return s;
-}
-
-static void BNREvent(NSString *fmt, ...) {
+static void BNRLogLine(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    @synchronized (BNREvents()) {
-        if (BNREvents().count < 600) [BNREvents() addObject:msg];
-    }
+
+    NSLog(@"[BNR] %@", msg);        // 同时进系统日志
+
+    @try {
+        NSString *path = BNRLogPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        NSString *line = [NSString stringWithFormat:@"%@  %@\n", [NSDate date], msg];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) return;
+        [fh seekToEndOfFile];
+        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        [fh closeFile];
+    } @catch (NSException *e) { (void)e; }
 }
 
-static void BNRAddUnique(NSMutableSet *set, NSString *value, NSUInteger cap) {
-    if (!value) return;
-    @synchronized (set) {
-        if (set.count < cap) [set addObject:value];
-    }
-}
-
-#pragma mark - 判定：刷新是不是用户自己拉的
+#pragma mark - 刷新状态判定
 
 static BOOL BNRIsFooter(id comp) {
     const char *n = BNRClassNameC(comp);
@@ -130,7 +98,7 @@ static NSInteger BNRStateOf(id comp) {
     @try {
         if ([p respondsToSelector:@selector(state)]) return [p state];
     } @catch (NSException *e) { (void)e; }
-    return kStateIdle;
+    return 1;   // Idle
 }
 
 static UIScrollView *BNRScrollViewOf(id comp) {
@@ -144,45 +112,33 @@ static UIScrollView *BNRScrollViewOf(id comp) {
     return nil;
 }
 
+// 用户正在拖屏幕 → 这是手动下拉，必须放行
 static BOOL BNRIsUserDriven(id comp) {
-    if (BNRStateOf(comp) == kStatePulling) return YES;      // 用户正拉着 → 是手动刷新
+    if (BNRStateOf(comp) == kStatePulling) return YES;
     UIScrollView *sv = BNRScrollViewOf(comp);
     if (sv && (sv.isDragging || sv.isTracking || sv.isDecelerating)) return YES;
     return NO;
 }
 
-static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
-    UIView *v = ctl.superview;
-    NSInteger depth = 0;
-    while (v && depth++ < 10) {
-        if ([v isKindOfClass:[UIScrollView class]]) {
-            UIScrollView *sv = (UIScrollView *)v;
-            return (sv.isDragging || sv.isTracking || sv.isDecelerating);
-        }
-        v = v.superview;
-    }
-    return YES;      // 找不到宿主滚动视图就放行，宁可漏拦也不误伤
-}
+#pragma mark - 方法签名校验（防止参数错位崩溃）
 
-#pragma mark - 方法签名校验（v1.2.0 新增，防止参数错位崩溃）
-
-// 方法签名形如 "v@:q" / "v@:q16" / "v24@0:8q16"，统一按「跳过数字偏移、逐段取类型」来解析。
 static const char *BNRNextType(const char *t) {
     if (!t) return NULL;
     while (*t && isdigit((unsigned char)*t)) t++;
     return (*t) ? t : NULL;
 }
 
-// -(void)foo    → v@:
+// -(void)foo  → v@:
 static BOOL BNREncVoidNoArg(const char *t) {
     const char *p = BNRNextType(t);    if (!p || *p != 'v') return NO;
     p = BNRNextType(p + 1);            if (!p || *p != '@') return NO;
     p = BNRNextType(p + 1);            if (!p || *p != ':') return NO;
     p = BNRNextType(p + 1);
-    return (p == NULL);                // 后面不能再有参数
+    return (p == NULL);
 }
 
-// -(void)foo:(NSInteger)x → v@:q
+// -(void)foo:(NSInteger)x → v@:q （本版暂未用到，留着下一档用）
+__attribute__((unused))
 static BOOL BNREncVoidIntegerArg(const char *t) {
     const char *p = BNRNextType(t);    if (!p || *p != 'v') return NO;
     p = BNRNextType(p + 1);            if (!p || *p != '@') return NO;
@@ -195,20 +151,19 @@ static BOOL BNREncVoidIntegerArg(const char *t) {
     return (p == NULL);
 }
 
-#pragma mark - 动态闸门
+#pragma mark - 闸门（纯 runtime，不用 substrate）
 
-typedef struct { Class cls; SEL sel; IMP imp; } BNRPatch;
+typedef struct { Class cls; IMP imp; } BNRPatch;
 static BNRPatch gPatches[32];
 static int      gPatchCount = 0;
 static int      gBlocked    = 0;
 static int      gHooked     = 0;
 
-// 找被我们替换掉的原实现：沿继承链匹配「类 + 选择子」
-static IMP BNROrigFor(id self, SEL cmd) {
+static IMP BNROrigFor(id self) {
     Class c = object_getClass(self);
     for (Class k = c; k != Nil; k = class_getSuperclass(k)) {
         for (int i = 0; i < gPatchCount; i++) {
-            if (gPatches[i].cls == k && sel_isEqual(gPatches[i].sel, cmd)) return gPatches[i].imp;
+            if (gPatches[i].cls == k) return gPatches[i].imp;
         }
     }
     return NULL;
@@ -216,37 +171,21 @@ static IMP BNROrigFor(id self, SEL cmd) {
 
 static void BNRHookedBeginRefreshing(id self, SEL _cmd) {
     BOOL block = NO;
-    if (kEnabled && kBlockRefresh) {
+    if (kBlockRefresh) {
         @try {
             if (!BNRIsFooter(self) && !BNRIsUserDriven(self)) block = YES;
         } @catch (NSException *e) { (void)e; block = NO; }
     }
     if (block) {
         __sync_fetch_and_add(&gBlocked, 1);
-        BNREvent(@"⛔️ 吃掉自动刷新 beginRefreshing → %@", BNRClassName(self));
+        BNRLogLine(@"⛔️ 吃掉自动刷新 beginRefreshing → %@", BNRClassName(self));
         return;
     }
-    IMP orig = BNROrigFor(self, _cmd);
+    IMP orig = BNROrigFor(self);
     if (orig) ((void (*)(id, SEL))orig)(self, _cmd);
 }
 
-static void BNRHookedSetState(id self, SEL _cmd, NSInteger state) {
-    BOOL block = NO;
-    if (kEnabled && kBlockRefresh && state == kStateRefresh) {
-        @try {
-            if (!BNRIsFooter(self) && !BNRIsUserDriven(self)) block = YES;
-        } @catch (NSException *e) { (void)e; block = NO; }
-    }
-    if (block) {
-        __sync_fetch_and_add(&gBlocked, 1);
-        BNREvent(@"⛔️ 吃掉自动刷新 setState:Refreshing → %@", BNRClassName(self));
-        return;
-    }
-    IMP orig = BNROrigFor(self, _cmd);
-    if (orig) ((void (*)(id, SEL, NSInteger))orig)(self, _cmd, state);
-}
-
-// 这个方法归哪个类「自己」实现？返回 Nil = 都是继承来的
+// 这个方法归哪个类「自己」实现？返回 Nil = 都是继承来的（不能改，会波及所有兄弟类）
 static Class BNROwnerOfSEL(Class c, SEL sel) {
     for (Class k = c; k != Nil; k = class_getSuperclass(k)) {
         unsigned int n = 0;
@@ -263,304 +202,213 @@ static Class BNROwnerOfSEL(Class c, SEL sel) {
     return Nil;
 }
 
-static void BNRPatchClass(Class c, SEL sel, IMP newImp, const char *label) {
-    if (gPatchCount >= 32) return;
-    Method m = class_getInstanceMethod(c, sel);
-    if (!m) return;
-    IMP old = method_setImplementation(m, newImp);
-    if (!old || old == newImp) return;          // 保险：绝不让 orig 指向自己（会死循环）
-    gPatches[gPatchCount].cls = c;
-    gPatches[gPatchCount].sel = sel;
-    gPatches[gPatchCount].imp = old;
-    gPatchCount++;
-    __sync_fetch_and_add(&gHooked, 1);
-    BNREvent(@"🔧 挂钩 -%s [%s]", label, class_getName(c));
-}
-
 static BOOL BNRNameLooksLikeRefresh(const char *n) {
     if (!n) return NO;
     return (strstr(n, "Refresh") != NULL) || (strstr(n, "PullToRefresh") != NULL);
 }
 
-// 返回 YES = 至少挂上了一个闸门
-static BOOL BNRInstallGates(void) {
-    unsigned int count = 0;
-    Class *list = objc_copyClassList(&count);
-    if (!list) return NO;
+#pragma mark - 弹窗（每一步由用户点「继续」推进，杜绝时序竞争）
 
-    int patched = 0;
-    SEL sBegin = @selector(beginRefreshing);
-    SEL sSet   = sel_registerName("setState:");
-
-    for (unsigned int i = 0; i < count; i++) {
-        Class c = list[i];
-        const char *nm = class_getName(c);
-        if (!BNRNameLooksLikeRefresh(nm)) continue;
-
-        BNRAddUnique(BNRRefreshClasses(), [NSString stringWithUTF8String:nm], 40);
-
-        // 只改「自己实现」的方法；改父类共享的 Method 会波及所有兄弟类
-        if (BNROwnerOfSEL(c, sBegin) == c) {
-            Method m = class_getInstanceMethod(c, sBegin);
-            const char *t = m ? method_getTypeEncoding(m) : NULL;
-            if (BNREncVoidNoArg(t)) {
-                BNRPatchClass(c, sBegin, (IMP)&BNRHookedBeginRefreshing, "beginRefreshing");
-                patched++;
-            } else {
-                BNREvent(@"⚠️ 跳过 %s -beginRefreshing（签名不符：%s）", nm, t ? t : "?");
-            }
-        }
-        if (BNROwnerOfSEL(c, sSet) == c) {
-            Method m = class_getInstanceMethod(c, sSet);
-            const char *t = m ? method_getTypeEncoding(m) : NULL;
-            if (BNREncVoidIntegerArg(t)) {
-                BNRPatchClass(c, sSet, (IMP)&BNRHookedSetState, "setState:");
-                patched++;
-            }
-        }
-    }
-    free(list);
-    return patched > 0;
-}
-
-#pragma mark - 前置声明（探针里要用到安装入口）
-
-static BOOL gBootstrapped;
-static BOOL gBootRunning;
-static void BNRBootstrap(void);
-static void BNRHandleBecameActive(void);
-static void BNRDumpLogToFile(void);
-static void BNRShowAlert(void);
-
-#pragma mark - 探针（全部走 UIKit，类都有完整头文件，安全）
-
-%hook UIViewController
-
-- (void)viewWillAppear:(BOOL)animated {
-    %orig;
-    if (kProbeVC) {
-        const char *n = BNRClassNameC(self);
-        if (BNRKeywordHitC(n)) {
-            NSString *s = [NSString stringWithUTF8String:n];
-            BNRAddUnique(BNRSeenVC(), s, 40);
-            BNREvent(@"▶️ 页面将出现: %@", s);
-        }
-    }
-    if (!gBootstrapped) dispatch_async(dispatch_get_main_queue(), ^{ BNRBootstrap(); });
-}
-
-- (void)viewDidDisappear:(BOOL)animated {
-    %orig;
-    if (kProbeVC) {
-        const char *n = BNRClassNameC(self);
-        if (BNRKeywordHitC(n)) BNREvent(@"⏹ 页面已离开: %@", [NSString stringWithUTF8String:n]);
-    }
-}
-
-- (void)dealloc {
-    if (kProbeVC) {
-        const char *n = BNRClassNameC(self);
-        if (BNRKeywordHitC(n)) BNREvent(@"💀 页面被销毁(dealloc): %@", [NSString stringWithUTF8String:n]);
-    }
-    %orig;
-}
-
-%end
-
-%hook UICollectionView
-
-- (void)reloadData {
-    if (kProbeReload) {
-        @try {
-            const char *dn = BNRClassNameC(self.delegate);
-            const char *sn = BNRClassNameC(self.dataSource);
-            if (BNRKeywordHitC(dn) || BNRKeywordHitC(sn)) {
-                NSString *line = [NSString stringWithFormat:@"🔁 reloadData [%@] delegate=%s",
-                                  BNRClassName(self), dn ? dn : "(nil)"];
-                BNRAddUnique(BNRReloadOwners(), line, 40);
-                BNREvent(@"%@", line);
-            }
-        } @catch (NSException *e) { (void)e; }
-    }
-    %orig;
-}
-
-%end
-
-%hook UITableView
-
-- (void)reloadData {
-    if (kProbeReload) {
-        @try {
-            const char *dn = BNRClassNameC(self.delegate);
-            const char *sn = BNRClassNameC(self.dataSource);
-            if (BNRKeywordHitC(dn) || BNRKeywordHitC(sn)) {
-                NSString *line = [NSString stringWithFormat:@"🔁 reloadData [%@] delegate=%s",
-                                  BNRClassName(self), dn ? dn : "(nil)"];
-                BNRAddUnique(BNRReloadOwners(), line, 40);
-                BNREvent(@"%@", line);
-            }
-        } @catch (NSException *e) { (void)e; }
-    }
-    %orig;
-}
-
-%end
-
-#pragma mark - 副力闸门：系统原生 UIRefreshControl
-
-%hook UIRefreshControl
-
-- (void)beginRefreshing {
-    if (kEnabled && kBlockRefresh && !BNRUIRefreshIsUserDriven(self)) {
-        __sync_fetch_and_add(&gBlocked, 1);
-        BNREvent(@"⛔️ 吃掉自动刷新 UIRefreshControl beginRefreshing");
-        return;
-    }
-    %orig;
-}
-
-%end
-
-#pragma mark - 安装入口
-
-static BOOL gBootstrapped = NO;
-static int  gRetries      = 0;
-static BOOL gBootRunning  = NO;
-static BOOL gObserverDone = NO;
-
-static void BNRBootstrap(void);
-
-// 只在哔哩哔哩里动作，其它进程一律装死
-static BOOL BNRIsTargetApp(void) {
+static UIViewController *BNRRootVC(void) {
     @try {
-        NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-        return bid && [bid isEqualToString:[NSString stringWithUTF8String:kTargetBundle]];
-    } @catch (NSException *e) { (void)e; return NO; }
-}
-
-static void BNRRetryLater(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ BNRBootstrap(); });
-}
-
-static void BNRBootstrap(void) {
-    if (gBootstrapped || gBootRunning) return;
-    gBootRunning = YES;
-
-    if (!BNRIsTargetApp()) {
-        gBootstrapped = YES;
-        gBootRunning = NO;
-        return;
-    }
-
-    if (!gObserverDone) {
-        gObserverDone = YES;
-        @try {
-            [[NSNotificationCenter defaultCenter]
-                addObserverForName:UIApplicationDidBecomeActiveNotification
-                            object:nil
-                             queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *note) {
-                (void)note;
-                BNRHandleBecameActive();
-            }];
-        } @catch (NSException *e) { (void)e; }
-    }
-
-    BOOL ok = NO;
-    @try { ok = BNRInstallGates(); } @catch (NSException *e) { (void)e; ok = NO; }
-
-    if (ok) {
-        gBootstrapped = YES;
-        NSUInteger n = 0;
-        @synchronized (BNRRefreshClasses()) { n = BNRRefreshClasses().count; }
-        BNREvent(@"✅ 闸门安装完成：疑似刷新类 %lu 个 / 挂钩 %d 个（第 %d 次尝试）",
-                 (unsigned long)n, gHooked, gRetries + 1);
-    } else if (++gRetries >= 8) {
-        gBootstrapped = YES;
-        BNREvent(@"❌ 已尝试 8 次仍未发现任何刷新控件类 —— 首页刷新很可能不走 MJRefresh");
-    } else {
-        BNREvent(@"… 尚未发现刷新控件，1.5 秒后重试（第 %d 次）", gRetries);
-        BNRRetryLater();
-    }
-
-    gBootRunning = NO;
-}
-
-#pragma mark - 诊断汇报
-
-// 跳过「冷启动那次激活」，绝不在启动过程中弹窗
-static void BNRHandleBecameActive(void) {
-    static int activeCount = 0;
-    int n = __sync_add_and_fetch(&activeCount, 1);
-    if (n < 2 || !kShowAlert) return;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        BNRDumpLogToFile();
-        BNRShowAlert();
-    });
-}
-
-static NSString *BNRJoinSet(NSMutableSet *s, NSUInteger max) {
-    NSArray *arr = nil;
-    @synchronized (s) { arr = [s.allObjects sortedArrayUsingSelector:@selector(compare:)]; }
-    if (arr.count == 0) return @"无";
-    NSArray *sub = arr.count > max ? [arr subarrayWithRange:NSMakeRange(0, max)] : arr;
-    NSString *joined = [sub componentsJoinedByString:@"\n"];
-    if (arr.count > max) joined = [joined stringByAppendingFormat:@"\n…(共%lu项)", (unsigned long)arr.count];
-    return joined;
-}
-
-static void BNRDumpLogToFile(void) {
-    if (!kDebugFile) return;
-    @try {
-        NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/BiliNoRefresh.log"];
-        NSMutableString *s = [NSMutableString string];
-        @synchronized (BNREvents()) {
-            for (NSString *l in BNREvents()) [s appendFormat:@"%@\n", l];
-        }
-        [s writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    } @catch (NSException *e) { (void)e; }
-}
-
-static void BNRShowAlert(void) {
-    if (!kShowAlert) return;
-    @try {
-        UIWindow *win = nil;
         for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
             if (![sc isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                if (w.isKeyWindow) { win = w; break; }
+                if (w.isKeyWindow && w.rootViewController) return w.rootViewController;
             }
-            if (win) break;
         }
-        if (!win) win = UIApplication.sharedApplication.keyWindow;
-        UIViewController *root = win.rootViewController;
-        if (!root || root.presentedViewController) return;
-        if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return;
+        return UIApplication.sharedApplication.keyWindow.rootViewController;
+    } @catch (NSException *e) { (void)e; return nil; }
+}
 
-        NSMutableString *m = [NSMutableString string];
-        [m appendFormat:@"刷新控件类:\n%@\n\n", BNRJoinSet(BNRRefreshClasses(), 6)];
-        [m appendFormat:@"已挂钩方法: %d 个\n已拦截自动刷新: %d 次\n\n", gHooked, gBlocked];
-        [m appendFormat:@"关键页面:\n%@\n\n", BNRJoinSet(BNRSeenVC(), 6)];
-        [m appendFormat:@"reloadData 宿主:\n%@\n\n", BNRJoinSet(BNRReloadOwners(), 5)];
-        [m appendString:@"截这张图发我即可"];
+static void BNRAlert(NSString *title, NSString *msg, NSString *btn, void (^after)(void));
 
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"BiliNoRefresh v1.2.0 诊断"
-                                                                   message:m
+static void BNRAlertRetry(NSString *title, NSString *msg, NSString *btn, void (^after)(void), int tries) {
+    if (!kShowAlert) { if (after) after(); return; }
+    UIViewController *root = BNRRootVC();
+    if (!root) {
+        if (tries <= 0) { if (after) after(); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            BNRAlertRetry(title, msg, btn, after, tries - 1);
+        });
+        return;
+    }
+    @try {
+        UIViewController *host = root;
+        while (host.presentedViewController) host = host.presentedViewController;
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                                                                   message:msg
                                                             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [root presentViewController:ac animated:YES completion:nil];
-    } @catch (NSException *e) { (void)e; }
+        [ac addAction:[UIAlertAction actionWithTitle:btn
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) { (void)a; if (after) after(); }]];
+        [host presentViewController:ac animated:YES completion:nil];
+    } @catch (NSException *e) {
+        (void)e;
+        if (after) after();
+    }
+}
+
+static void BNRAlert(NSString *title, NSString *msg, NSString *btn, void (^after)(void)) {
+    BNRAlertRetry(title, msg, btn, after, 8);
+}
+
+#pragma mark - 第 ① 档：存活确认（不做任何实质动作）
+
+static void BNRStep2(void);
+
+static void BNRStep1(void) {
+    NSString *bid = @"(取不到)";
+    @try { bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)"; } @catch (NSException *e) { (void)e; }
+
+    // 安全网：只在哔哩哔哩进程里动作
+    if (![bid isEqualToString:[NSString stringWithUTF8String:kTargetBundle]]) {
+        BNRLogLine(@"非目标 App（%@），什么都不做", bid);
+        return;
+    }
+
+    NSMutableString *m = [NSMutableString string];
+    [m appendFormat:@"版本 %s 已注入并运行。\n\n", kVersion];
+    [m appendFormat:@"bundle: %@\n\n", bid];
+    [m appendString:@"关键类探测（决定下一步能不能找到刷新控件）:\n"];
+
+    NSArray *names = @[@"MJRefreshHeader", @"MJRefreshComponent", @"MJRefreshFooter",
+                       @"MJRefreshNormalHeader", @"UIRefreshControl"];
+    NSMutableArray *log = [NSMutableArray array];
+    for (NSString *n in names) {
+        Class c = objc_getClass(n.UTF8String);
+        [m appendFormat:@"%@ : %@\n", n, c ? @"✅ 存在" : @"❌ 不存在"];
+        [log addObject:[NSString stringWithFormat:@"%@=%@", n, c ? @"Y" : @"N"]];
+    }
+
+    BNRLogLine(@"=== 第①档 存活确认：bundle=%@  %@", bid, [log componentsJoinedByString:@" "]);
+    [m appendString:@"\n点「继续」进入第 ② 档（只读扫描类表，不修改任何东西）"];
+
+    BNRAlert([NSString stringWithFormat:@"① 存活确认  v%s", kVersion], m, @"继续", ^{ BNRStep2(); });
+}
+
+#pragma mark - 第 ② 档：只读扫描（绝不修改任何实现）
+
+static void BNRStep3(void);
+
+static void BNRStep2(void) {
+    NSMutableArray *hits = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *list = objc_copyClassList(&count);
+
+    if (list) {
+        for (unsigned int i = 0; i < count; i++) {
+            Class c = list[i];
+            const char *nm = class_getName(c);
+            if (!BNRNameLooksLikeRefresh(nm)) continue;
+
+            SEL sBegin = @selector(beginRefreshing);
+            SEL sSet   = sel_registerName("setState:");
+            BOOL ownBegin = (BNROwnerOfSEL(c, sBegin) == c);
+            BOOL ownSet   = (BNROwnerOfSEL(c, sSet) == c);
+            Method mb = class_getInstanceMethod(c, sBegin);
+            Method ms = class_getInstanceMethod(c, sSet);
+            const char *tb = mb ? method_getTypeEncoding(mb) : NULL;
+            const char *ts = ms ? method_getTypeEncoding(ms) : NULL;
+
+            [hits addObject:[NSString stringWithFormat:
+                @"%@\n   begin:%@ (%s)   setState:%@ (%s)", @(nm),
+                ownBegin ? @"自实现" : @"继承", tb ? tb : "-",
+                ownSet ? @"自实现" : @"继承", ts ? ts : "-"]];
+        }
+        free(list);
+    }
+
+    NSString *body = hits.count ? [hits componentsJoinedByString:@"\n"] : @"（一个都没找到）";
+    BNRLogLine(@"=== 第②档 只读扫描：类表总数=%u，疑似刷新类=%lu\n%@",
+               count, (unsigned long)hits.count, body);
+
+    NSArray *shown = hits.count > 6 ? [hits subarrayWithRange:NSMakeRange(0, 6)] : hits;
+    NSString *msg = [NSString stringWithFormat:
+        @"类表总数: %u\n疑似刷新控件类: %lu 个\n\n%@%@\n\n点「继续」进入第 ③ 档（真正安装闸门）",
+        count, (unsigned long)hits.count,
+        [shown componentsJoinedByString:@"\n"],
+        hits.count > 6 ? [NSString stringWithFormat:@"\n…(共%lu个)", (unsigned long)hits.count] : @""];
+
+    BNRAlert(@"② 只读扫描完成", msg, @"继续", ^{ BNRStep3(); });
+}
+
+#pragma mark - 第 ③ 档：安装闸门（只换 beginRefreshing）
+
+static NSMutableArray *gHookedNames = nil;
+
+static void BNRStep3(void) {
+    unsigned int count = 0;
+    Class *list = objc_copyClassList(&count);
+    SEL sBegin = @selector(beginRefreshing);
+    NSMutableArray *hooked  = [NSMutableArray array];
+    NSMutableArray *skipped = [NSMutableArray array];
+
+    if (list) {
+        for (unsigned int i = 0; i < count; i++) {
+            Class c = list[i];
+            const char *nm = class_getName(c);
+            if (!BNRNameLooksLikeRefresh(nm)) continue;
+            if (BNROwnerOfSEL(c, sBegin) != c) continue;      // 只改「自己实现」的
+
+            Method m = class_getInstanceMethod(c, sBegin);
+            const char *t = m ? method_getTypeEncoding(m) : NULL;
+            if (!BNREncVoidNoArg(t)) {
+                [skipped addObject:[NSString stringWithFormat:@"%s 签名不符(%s)", nm, t ? t : "-"]];
+                continue;
+            }
+            if (gPatchCount >= 32) break;
+
+            IMP old = method_setImplementation(m, (IMP)&BNRHookedBeginRefreshing);
+            if (!old || old == (IMP)&BNRHookedBeginRefreshing) continue;
+            gPatches[gPatchCount].cls = c;
+            gPatches[gPatchCount].imp = old;
+            gPatchCount++;
+            __sync_fetch_and_add(&gHooked, 1);
+            [hooked addObject:@(nm)];
+        }
+        free(list);
+    }
+
+    gHookedNames = hooked;
+
+    BNRLogLine(@"=== 第③档 安装闸门：挂钩 %lu 个 → %@   %@",
+               (unsigned long)hooked.count,
+               hooked.count ? [hooked componentsJoinedByString:@", "] : @"(无)",
+               skipped.count ? [skipped componentsJoinedByString:@", "] : @"");
+
+    NSString *msg = [NSString stringWithFormat:
+        @"已挂钩 -beginRefreshing 的类: %lu 个\n%@\n%@\n\n%@",
+        (unsigned long)hooked.count,
+        hooked.count ? [hooked componentsJoinedByString:@"\n"] : @"（无）",
+        skipped.count ? [NSString stringWithFormat:@"跳过: %@", [skipped componentsJoinedByString:@"\n"]] : @"",
+        (hooked.count > 0)
+            ? @"接着做两件事，然后切后台再切回来，我会报拦截次数：\n1) 搜索 → 点视频 → 播放 → 返回首页\n2) 首页手动下拉一次，确认手动刷新还能用"
+            : @"⚠️ 一个都没挂上：刷新控件类名不含 Refresh，需要换策略"];
+
+    BNRAlert(@"③ 闸门安装完成", msg, @"好", ^{
+        // 装好后：每次切回前台报一次统计，方便截图
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+            (void)note;
+            NSString *s = [NSString stringWithFormat:
+                @"已挂钩方法: %d 个\n已拦截自动刷新: %d 次\n\n挂钩的类:\n%@\n\n若始终为 0，说明首页刷新不走 beginRefreshing",
+                gHooked, gBlocked,
+                gHookedNames.count ? [gHookedNames componentsJoinedByString:@"\n"] : @"(无)"];
+            BNRLogLine(@"--- 切回前台统计：挂钩=%d 拦截=%d", gHooked, gBlocked);
+            BNRAlert(@"BiliNoRefresh 统计", s, @"好", nil);
+        }];
+    });
 }
 
 #pragma mark - 加载入口
-// ⚠️ 关键：构造函数跑在 dyld 阶段，这里【只能】排一个延后任务，绝不允许碰运行时。
+// ⚠️ dyld 阶段只排一个延后任务，绝不碰运行时、绝不弹窗。
 
 __attribute__((constructor))
 static void BNRInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ BNRBootstrap(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ BNRStep1(); });
 }
