@@ -1,0 +1,36 @@
+name: Build BiliNoAutoRefresh
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Theos
+        uses: waruhachi/theos-action@v2.6.3
+
+      - name: 编译 dylib
+        run: make clean && make FINALPACKAGE=1
+
+      - name: 打包 deb（可选，失败不影响 dylib）
+        continue-on-error: true
+        run: make package FINALPACKAGE=1
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find .theos -name "*.dylib" -exec cp {} out/ \; || true
+          find packages -name "*.deb" -exec cp {} out/ \; || true
+          ls -lR out
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliNoAutoRefresh
+          path: out/*
+          if-no-files-found: error
