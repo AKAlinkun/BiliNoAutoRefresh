@@ -1,0 +1,10 @@
+Package: com.workbuddy.bilinoautorefresh
+Name: BiliNoAutoRefresh
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 禁止哔哩哔哩 iOS 客户端首页 / 推荐流自动刷新，完整保留手动下拉刷新与上拉加载更多。
+Homepage: https://github.com/
+Maintainer: WorkBuddy
+Author: WorkBuddy
+Section: Tweaks
+Depends: mobilesubstrate
