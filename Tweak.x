@@ -27,6 +27,20 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
+#pragma mark - 目标类声明（必须！）
+//
+//  MJRefresh 不在我们的编译环境里，Logos 默认只会给被 hook 的类生成一条 @class 前向声明，
+//  那是「不完整类型」，clang 对不完整类型发消息会直接报错：
+//      error: receiver type 'MJRefreshHeader' for instance message is a forward declaration
+//  所以这里自己补上完整声明，让编译器拿到完整类型。
+//  注意：这只是编译期声明，不产生任何代码，与 App 内真实的 MJRefresh 实现互不干扰。
+
+@interface MJRefreshComponent : UIView
+@end
+
+@interface MJRefreshHeader : MJRefreshComponent
+@end
+
 #pragma mark - 开关
 
 static BOOL kEnabled        = YES;
@@ -38,6 +52,22 @@ static BOOL kProbe          = NO;
 static const NSInteger kMJStateIdle    = 1;
 static const NSInteger kMJStatePulling = 2;
 static const NSInteger kMJStateRefresh = 3;
+
+#pragma mark - 安全工具（全部用 C 函数，避免对不完整类型发消息）
+
+static NSString *BNRClassName(id obj) {
+    Class c = object_getClass(obj);
+    return c ? NSStringFromClass(c) : @"(unknown)";
+}
+
+static BOOL BNRIsKindOfClassNamed(id obj, const char *className) {
+    Class target = objc_getClass(className);
+    if (!target || !obj) return NO;
+    for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+        if (c == target) return YES;
+    }
+    return NO;
+}
 
 #pragma mark - 日志（只在 kDebugLog 打开时写文件）
 
@@ -61,7 +91,7 @@ static void BNRLog(NSString *fmt, ...) {
     @try {
         [fh seekToEndOfFile];
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) { (void)e; }
     [fh closeFile];
 }
 
@@ -75,14 +105,14 @@ static UIScrollView *BNRScrollViewOf(id comp) {
         if ([comp respondsToSelector:NSSelectorFromString(@"scrollView")]) {
             sv = [comp valueForKey:@"scrollView"];
         }
-    } @catch (NSException *e) { sv = nil; }
+    } @catch (NSException *e) { (void)e; sv = nil; }
     if ([sv isKindOfClass:[UIScrollView class]]) return sv;
 
     @try {
         if ([comp respondsToSelector:NSSelectorFromString(@"superScrollView")]) {
             sv = [comp valueForKey:@"superScrollView"];
         }
-    } @catch (NSException *e) { sv = nil; }
+    } @catch (NSException *e) { (void)e; sv = nil; }
     return [sv isKindOfClass:[UIScrollView class]] ? sv : nil;
 }
 
@@ -92,7 +122,7 @@ static NSInteger BNRStateOf(id comp) {
         if ([comp respondsToSelector:NSSelectorFromString(@"state")]) {
             st = [[comp valueForKey:@"state"] integerValue];
         }
-    } @catch (NSException *e) { st = kMJStateIdle; }
+    } @catch (NSException *e) { (void)e; st = kMJStateIdle; }
     return st;
 }
 
@@ -128,7 +158,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 - (void)beginRefreshing {
     if (kEnabled && !BNRIsUserDriven(self)) {
-        BNRLog(@"❌ 拦截自动刷新 [beginRefreshing] %@", NSStringFromClass([self class]));
+        BNRLog(@"拦截自动刷新 [beginRefreshing] %@", BNRClassName(self));
         return;
     }
     %orig;
@@ -136,7 +166,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 - (void)setState:(NSInteger)state {
     if (kEnabled && state == kMJStateRefresh && !BNRIsUserDriven(self)) {
-        BNRLog(@"❌ 拦截自动刷新 [setState:Refreshing] %@", NSStringFromClass([self class]));
+        BNRLog(@"拦截自动刷新 [setState:Refreshing] %@", BNRClassName(self));
         return;
     }
     %orig;
@@ -144,7 +174,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 %end
 
-%end   // group MJHeaderGate
+%end
 
 #pragma mark - 主力闸门二：MJRefresh 基类（兜底自研刷新头重写 beginRefreshing 的情况）
 
@@ -153,12 +183,8 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 %hook MJRefreshComponent
 
 - (void)beginRefreshing {
-    BOOL isHeader = NO;
-    Class headerCls = NSClassFromString(@"MJRefreshHeader");
-    if (headerCls) isHeader = [self isKindOfClass:headerCls];
-
-    if (kEnabled && isHeader && !BNRIsUserDriven(self)) {
-        BNRLog(@"❌ 拦截自动刷新 [component beginRefreshing] %@", NSStringFromClass([self class]));
+    if (kEnabled && BNRIsKindOfClassNamed(self, "MJRefreshHeader") && !BNRIsUserDriven(self)) {
+        BNRLog(@"拦截自动刷新 [component beginRefreshing] %@", BNRClassName(self));
         return;
     }
     %orig;
@@ -166,7 +192,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 %end
 
-%end   // group MJComponentGate
+%end
 
 #pragma mark - 副力闸门：系统原生 UIRefreshControl
 
@@ -176,7 +202,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 - (void)beginRefreshing {
     if (kEnabled && kBlockUIRefresh && !BNRUIRefreshIsUserDriven(self)) {
-        BNRLog(@"❌ 拦截自动刷新 [UIRefreshControl beginRefreshing]");
+        BNRLog(@"拦截自动刷新 [UIRefreshControl beginRefreshing]");
         return;
     }
     %orig;
@@ -184,7 +210,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 %end
 
-%end   // group UIRefreshGate
+%end
 
 #pragma mark - 排障探针（默认关闭，不影响日常使用）
 
@@ -194,10 +220,10 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 - (void)viewWillAppear:(BOOL)animated {
     if (kDebugLog && kProbe) {
-        NSString *name = NSStringFromClass([self class]);
+        NSString *name = BNRClassName(self);
         for (NSString *kw in @[@"Home", @"Index", @"Feed", @"Recommend", @"Timeline", @"Square", @"Popular"]) {
             if ([name containsString:kw]) {
-                BNRLog(@"👀 页面出现: %@", name);
+                BNRLog(@"页面出现: %@", name);
                 break;
             }
         }
@@ -207,7 +233,7 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
 %end
 
-%end   // group ProbeGate
+%end
 
 #pragma mark - 初始化
 // 注意：一旦自己写了 %ctor，Logos 就不会再自动初始化任何分组，
@@ -219,9 +245,9 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
 
     if (headerCls) {
         %init(MJHeaderGate);
-        BNRLog(@"✅ MJRefreshHeader 闸门已启用");
+        BNRLog(@"MJRefreshHeader 闸门已启用");
     } else {
-        BNRLog(@"⚠️ 未发现 MJRefreshHeader");
+        BNRLog(@"未发现 MJRefreshHeader");
     }
 
     if (componentCls) {
@@ -231,9 +257,8 @@ static BOOL BNRUIRefreshIsUserDriven(UIRefreshControl *ctl) {
     %init(UIRefreshGate);
     %init(ProbeGate);
 
-    // 记一条加载横幅（仅 kDebugLog 打开时落盘）
     if (!headerCls && !componentCls) {
-        BNRLog(@"⚠️ 目标 App 未使用 MJRefresh，主力闸门未生效，请打开 kProbe 反馈日志");
+        BNRLog(@"目标 App 未使用 MJRefresh，主力闸门未生效，请打开 kProbe 反馈日志");
     }
     BNRLog(@"=== BiliNoAutoRefresh 已加载 ===");
 }
