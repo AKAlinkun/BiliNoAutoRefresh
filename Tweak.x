@@ -1,7 +1,14 @@
 //
-//  Tweak.x  —— BiliNoAutoRefresh v1.4.1（保守版）
+//  Tweak.x  —— BiliNoAutoRefresh v1.4.2（保守版）
 //
-//  ── v1.4.0 实测把 App 搞卡死了，这一版先把风险撤干净 ────────────────────
+//  ── v1.4.2 相对 v1.4.1 只做一件事：修编译错误 ──────────────────────────────
+//  v1.4.1 在 CI 上报：Tweak.x:506: use of undeclared identifier 'kStateRefreshing'
+//  原因：编辑常量声明时把 `static const NSInteger kStateRefreshing = 3;` 整行误删了。
+//  已补回，并把刷新状态枚举写全（Idle=1 Pulling=2 Refreshing=3 WillRefresh=4 NoMoreData=5）。
+//  ★ 逻辑与 v1.4.1 **完全一致**，没有任何行为改动。
+//  ★ 顺带在 CI 里加了一道「常量定义自检」，这类错误以后会在编译前就报出人话。
+//
+//  ── v1.4.0 实测把 App 搞卡死了，v1.4.1 把风险撤干净 ──────────────────────
 //  现象：注入 v1.4.0 后「打开 B站启动很慢，首页直接卡死」，封面图全是灰的。
 //  与「能正常用」的 v1.3.0 相比，v1.4.0 多出三个**全新变量**，本版逐一处理：
 //
@@ -58,10 +65,12 @@ static BOOL   kBreakRetryLoop   = YES;   // 阀③ 重试循环熔断
 static double kCooldownSecs     = 30.0;  //      熔断后静默这么久
 
 static const char *kTargetBundle = "tv.danmaku.bilianime";
-static const char *kVersion      = "1.4.1";
+static const char *kVersion      = "1.4.2";
 
-// 刷新状态取值（与 MJRefresh / BFCRefresh 一致）
-static const NSInteger kStatePulling = 2;
+// 刷新状态取值（与 MJRefresh / BFCRefresh 一致：Idle=1 Pulling=2 Refreshing=3 WillRefresh=4 NoMoreData=5）
+// ★ 这两个常量必须成对存在：漏掉任何一个都会在 CI 编译期报 "use of undeclared identifier"
+static const NSInteger kStatePulling    = 2;
+static const NSInteger kStateRefreshing = 3;
 
 // 收尾保护：刚放行过用户自己的刷新 → 这段时间内不做几何复位，绝不打扰用户的下拉
 static const NSTimeInterval kAllowGrace = 2.0;

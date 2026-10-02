@@ -1,10 +1,9 @@
 Package: com.workbuddy.bilinoautorefresh
 Name: BiliNoAutoRefresh
-Version: 1.0.0
+Version: 1.4.2
 Architecture: iphoneos-arm
-Description: 禁止哔哩哔哩 iOS 客户端首页 / 推荐流自动刷新，完整保留手动下拉刷新与上拉加载更多。
+Description: 禁止哔哩哔哩 iOS 客户端自动刷新（返回首页时的那次刷新），完整保留手动下拉刷新与上拉加载更多。v1.4.2：仅修复 v1.4.1 的编译错误（kStateRefreshing 常量定义缺失）并补全状态枚举，逻辑与 v1.4.1 完全一致 —— 无全局热路径钩子、无 CydiaSubstrate 依赖、三道安全阀齐全，任何情况下都不会卡界面。
 Homepage: https://github.com/
 Maintainer: WorkBuddy
 Author: WorkBuddy
 Section: Tweaks
-Depends: mobilesubstrate
