@@ -51,7 +51,7 @@
 #pragma mark - 配置
 
 static BOOL kBlockRefresh = YES;    // 总闸：NO = 只观察不拦（排障用）
-static BOOL kShowAlert    = YES;    // 关掉 = 不弹统计窗（拦截能力不受影响）
+static BOOL kShowAlert    = NO;     // v1.6.1 日常版：关掉（不再切前台弹统计窗）。排障时改回 YES 重编
 static BOOL kProbeTrigger = YES;    // 记录刷新来源（哪个页面 + 调用栈）
 static BOOL kRetract      = YES;    // 拦住之后做一次性收尾（把半拉状态收回来）
 
@@ -62,7 +62,7 @@ static BOOL   kBreakRetryLoop   = YES;   // 阀③
 static double kCooldownSecs     = 30.0;
 
 static const char *kTargetBundle = "tv.danmaku.bilianime";
-static const char *kVersion      = "1.6.0";
+static const char *kVersion      = "1.6.1";
 
 // 刷新状态取值（MJRefresh / BFCRefresh 系列：Idle=1 Pulling=2 Refreshing=3 WillRefresh=4 NoMoreData=5）
 static const NSInteger kStatePulling = 2;
@@ -602,9 +602,10 @@ static void BNRAlert(NSString *title, NSString *msg, NSString *btn) {
 
 static void BNRShowStats(void) {
     @try {
-        if (!kShowAlert) return;
+        // ★ v1.6.1 日常版：弹窗由 kShowAlert 控制；即使不弹窗，也照样把统计写进日志文件，
+        //   这样「日常无打扰」和「留一条排障痕迹」可以兼得，不需要为了排障专门重编一版。
         if (gStartTime <= 0) return;
-        if (BNRNow() - gStartTime < 15.0) return;    // 启动 15 秒内不弹，别干扰启动
+        if (BNRNow() - gStartTime < 15.0) return;    // 启动 15 秒内不打扰，别干扰启动
 
         NSString *cls   = gHookedNames.count ? [gHookedNames componentsJoinedByString:@"\n"] : @"(无)";
         NSString *hints = gFound.count ? [gFound componentsJoinedByString:@"\n\n"] : @"(还没捕捉到)";
